@@ -369,15 +369,13 @@ class SpotifyPlatform(BasePlatform):
         )
 
         seen_rows: dict[str, dict[str, str]] = {}
-        stable_iterations = 0
 
         viewport = await page.locator("main").bounding_box()
         if viewport is None:
             return list(seen_rows.values())
 
-        for _ in range(25):
-            current_rows = await row_locator.evaluate_all(row_eval_script)
-            for row in current_rows:
+        async def _harvest() -> None:
+            for row in await row_locator.evaluate_all(row_eval_script):
                 row_number = str(row.get("row_number", "")).strip()
                 track_href = str(row.get("track_href", "")).strip()
                 title = str(row.get("title", "")).strip()
@@ -386,33 +384,45 @@ class SpotifyPlatform(BasePlatform):
                 key = row_number or f"{track_href}|{title}"
                 seen_rows.setdefault(key, row)
 
-            if expected_count is not None and len(seen_rows) >= expected_count:
-                break
+        def _complete() -> bool:
+            return expected_count is not None and len(seen_rows) >= expected_count
 
-            before_count = len(seen_rows)
+        async def _hover_list() -> None:
             await page.mouse.move(
                 viewport["x"] + viewport["width"] / 2,
                 viewport["y"] + min(250, max(100, viewport["height"] - 40)),
             )
-            await page.mouse.wheel(0, 2200)
-            await page.wait_for_timeout(700)
 
-            refreshed_rows = await row_locator.evaluate_all(row_eval_script)
-            for row in refreshed_rows:
-                row_number = str(row.get("row_number", "")).strip()
-                track_href = str(row.get("track_href", "")).strip()
-                title = str(row.get("title", "")).strip()
-                if not track_href or not title:
-                    continue
-                key = row_number or f"{track_href}|{title}"
-                seen_rows.setdefault(key, row)
+        # The tracklist is virtualized and fast scrolling skips rows, so a single
+        # sweep is lossy. Sweep top-to-bottom in small steps, and when the expected
+        # count wasn't reached, jump back to the top and sweep again.
+        for sweep in range(3):
+            if sweep:
+                await _hover_list()
+                await page.mouse.wheel(0, -1_000_000)
+                await page.wait_for_timeout(1_000)
 
-            if len(seen_rows) == before_count:
-                stable_iterations += 1
-                if stable_iterations >= 5:
-                    break
-            else:
-                stable_iterations = 0
+            stable_iterations = 0
+            for _ in range(40):
+                await _harvest()
+                if _complete():
+                    return list(seen_rows.values())
+
+                before_count = len(seen_rows)
+                await _hover_list()
+                await page.mouse.wheel(0, 1_200)
+                await page.wait_for_timeout(600)
+                await _harvest()
+
+                if len(seen_rows) == before_count:
+                    stable_iterations += 1
+                    if stable_iterations >= 5:
+                        break
+                else:
+                    stable_iterations = 0
+
+            if _complete() or expected_count is None:
+                break
 
         return list(seen_rows.values())
 
