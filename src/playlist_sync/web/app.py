@@ -190,6 +190,10 @@ def _spotify_card(has_token, delete_token, has_usable_spotify_auth) -> None:  # 
                     ui.label("Use Spotify OAuth if possible. The copied web-player cURL token is a fallback and can be rate limited immediately.").style(
                         "color:#fbbf24; font-size:0.84rem; margin-bottom:12px"
                     )
+                    ui.label("Easiest option: run  uv run playlist-sync auth login spotify  in a terminal — "
+                             "it opens a browser window to log in and needs no developer app or copied tokens.").style(
+                        "color:#4ade80; font-size:0.84rem; margin-bottom:12px; font-family:monospace"
+                    )
 
                     def _start_spotify_oauth() -> None:
                         from spotipy.oauth2 import SpotifyOAuth
@@ -332,6 +336,12 @@ def _ytmusic_card(has_token, delete_token, HEADERS_FILE, OAUTH_FILE) -> None:  #
                             "color:#a78bfa; font-size:1.1rem; font-weight:700"
                         )
                         ui.button(icon="close", on_click=dlg.close).props("flat round dense color=grey")
+
+                    ui.label("Easiest option: run  uv run playlist-sync auth login ytmusic  in a terminal — "
+                             "it opens a browser window to log in and captures credentials automatically. "
+                             "The steps below are the manual fallback.").style(
+                        "color:#4ade80; font-size:0.84rem; margin-bottom:12px; font-family:monospace"
+                    )
 
                     # Step 1 — open YTM
                     with ui.row().classes("items-start gap-3 mb-4"):
@@ -477,7 +487,8 @@ async def sync_page() -> None:
                 ).tooltip("Load playlists from source platform")
 
             pl_row.bind_visibility_from(sync_type, "value", backward=lambda v: v == "Playlist")
-            load_status = ui.label("").style("color:#6b7280; font-size:0.78rem; margin-top:-8px")
+            load_status = ui.label("Click ⟳ above to load your playlists from the source platform.").style(
+                "color:#6b7280; font-size:0.78rem; margin-top:-8px")
             load_status.bind_visibility_from(sync_type, "value", backward=lambda v: v == "Playlist")
 
             ui.separator().style("margin:4px 0")
