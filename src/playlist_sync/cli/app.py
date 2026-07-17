@@ -150,6 +150,10 @@ def playlists_list(platform: str) -> None:
               help="Conflict resolution strategy")
 @click.option("--workers", default=1, type=click.IntRange(1, 16), show_default=True,
               help="Number of concurrent match workers to use during track search and matching")
+@click.option("--no-cache", is_flag=True, default=False,
+              help="Ignore the global match cache and search every track fresh")
+@click.option("--no-musicbrainz", is_flag=True, default=False,
+              help="Disable MusicBrainz alias lookups for hard-to-match tracks")
 def sync(
     playlist_name: str,
     source: str,
@@ -161,6 +165,8 @@ def sync(
     no_interactive: bool,
     conflict: str,
     workers: int,
+    no_cache: bool,
+    no_musicbrainz: bool,
 ) -> None:
     """Sync PLAYLIST_NAME from one platform to another.
 
@@ -181,6 +187,8 @@ def sync(
             ai_model=ai_model,
             ai_base_url=ai_base_url,
             workers=workers,
+            use_match_cache=not no_cache,
+            use_musicbrainz=not no_musicbrainz,
         )
 
         def _on_progress(current: int, total: int, track: object) -> None:

@@ -125,8 +125,10 @@ class TrackMatcher:
         ai_model: Optional[str] = None,
         ai_base_url: Optional[str] = None,
         ai_api_key: Optional[str] = None,
+        use_musicbrainz: bool = True,
     ) -> None:
         self.use_ai = use_ai
+        self.use_musicbrainz = use_musicbrainz
         self.ai_model = ai_model or os.environ.get("AI_MODEL", DEFAULT_AI_MODEL)
         self._ai_base_url = ai_base_url or os.environ.get("AI_BASE_URL")
         self._ai_api_key = ai_api_key or os.environ.get("AI_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -146,7 +148,10 @@ class TrackMatcher:
         """Find the best match for `source` on `target_platform`."""
         candidates_raw = await target_platform.search_track(source.search_query, limit=5)
 
-        return await self._match_from_candidates(source, candidates_raw)
+        result = await self._match_from_candidates(source, candidates_raw)
+        if result.status == MatchStatus.NOT_FOUND:
+            result = await self._not_found_fallback(source, target_platform, result)
+        return result
 
     async def match_many(
         self,
@@ -163,8 +168,72 @@ class TrackMatcher:
         )
         results: list[MatchResult] = []
         for source, candidates_raw in zip(sources, candidate_lists):
-            results.append(await self._match_from_candidates(source, candidates_raw))
+            result = await self._match_from_candidates(source, candidates_raw)
+            if result.status == MatchStatus.NOT_FOUND:
+                result = await self._not_found_fallback(source, target_platform, result)
+            results.append(result)
         return results
+
+    async def _not_found_fallback(
+        self,
+        source: Track,
+        target_platform: BasePlatform,
+        primary: MatchResult,
+    ) -> MatchResult:
+        """Rescue pipeline for tracks fuzzy matching gave up on.
+
+        1. MusicBrainz alias variants: platforms often credit the same artist in
+           different scripts ("美波" vs "Minami"); rescoring against alias variants
+           (plus one extra search per variant) bridges that.
+        2. AI judgment on the pooled candidates: models know that "廻廻奇譚" and
+           "Kaikai Kitan" are the same song even when no alias data exists.
+        """
+        pooled: dict[str, Track] = {
+            (t.platform_id or repr(t)): t for t, _ in primary.candidates
+        }
+        best = primary
+
+        if self.use_musicbrainz:
+            from playlist_sync.core.enrichment import variant_tracks
+
+            for variant in await variant_tracks(source):
+                extra = await target_platform.search_track(variant.search_query, limit=5)
+                for track in extra:
+                    pooled.setdefault(track.platform_id or repr(track), track)
+                if not pooled:
+                    continue
+                var_result = await self._match_from_candidates(variant, list(pooled.values()))
+                if var_result.status in (MatchStatus.MATCHED, MatchStatus.MANUAL_OVERRIDE):
+                    return MatchResult(
+                        source_track=source,
+                        matched_track=var_result.matched_track,
+                        status=MatchStatus.MATCHED,
+                        confidence=var_result.confidence,
+                        candidates=var_result.candidates,
+                    )
+                if var_result.status == MatchStatus.AMBIGUOUS and var_result.confidence > best.confidence:
+                    best = MatchResult(
+                        source_track=source,
+                        matched_track=var_result.matched_track,
+                        status=MatchStatus.AMBIGUOUS,
+                        confidence=var_result.confidence,
+                        candidates=var_result.candidates,
+                    )
+
+        if best.status == MatchStatus.NOT_FOUND and self.use_ai and pooled:
+            scored = [(t, _track_score(source, t)) for t in pooled.values()]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            choice = await self._ask_ai(source, scored[:5])
+            if choice is not None:
+                return MatchResult(
+                    source_track=source,
+                    matched_track=choice,
+                    status=MatchStatus.MATCHED,
+                    confidence=AMBIGUOUS_THRESHOLD,  # low-confidence rescue
+                    candidates=scored,
+                )
+
+        return best
 
     async def _match_from_candidates(self, source: Track, candidates_raw: list[Track]) -> MatchResult:
         """Apply the scoring and AI decision pipeline to a source track and a prepared candidate list."""
