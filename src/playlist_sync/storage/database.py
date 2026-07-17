@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DEFAULT_DB_PATH = Path.home() / ".config" / "playlist-sync" / "history.db"
@@ -71,6 +71,8 @@ class TrackMapping(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_platform: Mapped[str] = mapped_column(String(50))
     source_track_key: Mapped[str] = mapped_column(String(500), index=True)
+    source_title: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    source_artists: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     target_platform: Mapped[str] = mapped_column(String(50))
     target_platform_id: Mapped[str] = mapped_column(String(200))
     target_title: Mapped[str] = mapped_column(String(500))
@@ -79,6 +81,25 @@ class TrackMapping(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PlaylistSnapshot(Base):
+    """Point-in-time capture of a playlist's membership, taken before writes.
+
+    The safety net for sync/reconcile: `playlist-sync snapshots restore <id>`
+    puts a playlist back to exactly this track list.
+    """
+
+    __tablename__ = "playlist_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(50))
+    playlist_id: Mapped[str] = mapped_column(String(200), index=True)
+    playlist_name: Mapped[str] = mapped_column(String(500))
+    reason: Mapped[str] = mapped_column(String(50))  # pre_sync / pre_reconcile / pre_restore / manual
+    track_count: Mapped[int] = mapped_column(Integer, default=0)
+    tracks: Mapped[list] = mapped_column(JSON)  # [{id, title, artists}]
+    taken_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class UnmatchedTrack(Base):
@@ -95,8 +116,23 @@ class UnmatchedTrack(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+def _migrate(engine) -> None:  # type: ignore[no-untyped-def]
+    """Additive migrations create_all can't do (new columns on existing tables)."""
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(track_mappings)"))}
+        if existing:  # table pre-exists; add any missing columns
+            for column, ddl in (
+                ("source_title", "ALTER TABLE track_mappings ADD COLUMN source_title VARCHAR(500)"),
+                ("source_artists", "ALTER TABLE track_mappings ADD COLUMN source_artists VARCHAR(1000)"),
+            ):
+                if column not in existing:
+                    conn.execute(text(ddl))
+        conn.commit()
+
+
 def create_db(db_path: Path = DEFAULT_DB_PATH) -> sessionmaker[Session]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"sqlite:///{db_path}", echo=False)
+    _migrate(engine)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)

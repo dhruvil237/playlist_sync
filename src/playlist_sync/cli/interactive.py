@@ -87,12 +87,15 @@ def print_sync_summary(result) -> None:  # type: ignore[no-untyped-def]
     grid = Table.grid(padding=(0, 2))
     grid.add_column()
     grid.add_column()
-    grid.add_row("[bold green]Matched[/]", str(len(r.matched)))
+    grid.add_row("[bold green]Newly matched[/]", str(len(r.matched)))
     grid.add_row("[bold yellow]Ambiguous[/]", str(len(r.ambiguous)))
     grid.add_row("[bold red]Not found[/]", str(len(r.not_found)))
-    grid.add_row("[dim]Skipped (already present)[/]", str(len(r.skipped)))
+    grid.add_row("[dim]Already in sync[/]", str(len(r.skipped)))
     grid.add_row("[bold]Total[/]", str(r.total))
-    grid.add_row("[bold]Success rate[/]", f"{r.success_rate:.0%}")
+    if r.needed_matching:
+        grid.add_row("[bold]Match rate[/]", f"{r.success_rate:.0%} of {r.needed_matching} needing a match")
+    else:
+        grid.add_row("[bold]Match rate[/]", "everything already in sync")
 
     console.print(Panel(
         grid,

@@ -108,7 +108,17 @@ class SyncResult:
         return len(self.matched) + len(self.ambiguous) + len(self.not_found) + len(self.skipped)
 
     @property
+    def needed_matching(self) -> int:
+        """Tracks that were not already in sync (skipped) and thus needed a match."""
+        return len(self.matched) + len(self.ambiguous) + len(self.not_found)
+
+    @property
     def success_rate(self) -> float:
-        if self.total == 0:
-            return 0.0
-        return len(self.matched) / self.total
+        """Share of tracks-that-needed-matching that matched.
+
+        A fully in-sync playlist (everything skipped) is a 100% success,
+        not a 0% one.
+        """
+        if self.needed_matching == 0:
+            return 1.0 if self.total else 0.0
+        return len(self.matched) / self.needed_matching

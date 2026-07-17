@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from typing import Optional
 
 
 def _curl_to_headers_raw(curl: str) -> str:
@@ -63,7 +62,7 @@ async def spotify_callback(code: str = "", error: str = "") -> RedirectResponse:
         return RedirectResponse("/?notify=spotify_ok")
     except Exception as e:
         print(f"[spotify callback error] {e}")
-        return RedirectResponse(f"/?notify=spotify_error")
+        return RedirectResponse("/?notify=spotify_error")
 
 
 # ── YTMusic headers receive endpoint ─────────────────────────────────────────
@@ -90,6 +89,8 @@ def _nav(current: str) -> None:
     pages = [
         ("link", "Connections", "/"),
         ("sync", "Sync",        "/sync"),
+        ("rate_review", "Review", "/review"),
+        ("settings_backup_restore", "Snapshots", "/snapshots"),
         ("history", "History",  "/history"),
         ("settings", "Settings","/settings"),
     ]
@@ -306,11 +307,11 @@ def _ytmusic_card(has_token, delete_token, HEADERS_FILE, OAUTH_FILE) -> None:  #
                 "Youtube_Music_icon.svg/512px-Youtube_Music_icon.svg.png"
             ).style("width:36px;height:36px")
             ui.label("YouTube Music").style("color:white; font-size:1.1rem; font-weight:600")
-            status_icon = ui.icon("circle", color="green" if connected else "grey").style(
+            ui.icon("circle", color="green" if connected else "grey").style(
                 "font-size:0.75rem; margin-left:auto"
             )
 
-        status_lbl = ui.label("Connected" if connected else "Not connected").style(
+        ui.label("Connected" if connected else "Not connected").style(
             f"color:{'#4ade80' if connected else '#6b7280'}; font-size:0.82rem; margin-bottom:14px"
         )
 
@@ -484,6 +485,11 @@ async def sync_page() -> None:
             with ui.row().classes("gap-6"):
                 dry_run = ui.checkbox("Dry run (preview only)")
                 use_ai  = ui.checkbox("AI matching", value=True)
+                prune   = ui.checkbox("Prune stale tracks after sync").tooltip(
+                    "After syncing, remove target entries that no longer belong "
+                    "(dropped from source, outdated versions, duplicates). "
+                    "You confirm the removal list first; a snapshot is saved."
+                )
 
         # ── Start button ──────────────────────────────────────────────────────
         start_btn = ui.button("Start Sync", on_click=lambda: asyncio.ensure_future(_start())).style(
@@ -691,22 +697,291 @@ async def sync_page() -> None:
             prog_pct.set_text("100%")
             prog_lbl.set_text("Done")
             log_view.push("─" * 50)
-            log_view.push(f"  Matched:   {len(result.matched)}")
-            log_view.push(f"  Ambiguous: {len(result.ambiguous)}")
-            log_view.push(f"  Not found: {len(result.not_found)}")
-            log_view.push(f"  Skipped:   {len(result.skipped)}")
-            log_view.push(f"  Rate:      {result.success_rate:.0%}")
+            log_view.push(f"  Newly matched:   {len(result.matched)}")
+            log_view.push(f"  Ambiguous:       {len(result.ambiguous)}")
+            log_view.push(f"  Not found:       {len(result.not_found)}")
+            log_view.push(f"  Already in sync: {len(result.skipped)}")
+            if result.needed_matching:
+                log_view.push(f"  Match rate:      {result.success_rate:.0%} of {result.needed_matching} needing a match")
+            else:
+                log_view.push("  Everything already in sync")
             if result.dry_run:
                 log_view.push("  [DRY RUN — nothing was written]")
             ui.notify(
-                f"Done — {result.success_rate:.0%} matched",
+                "Done — everything already in sync" if not result.needed_matching
+                else f"Done — {result.success_rate:.0%} of {result.needed_matching} matched",
                 type="positive" if result.success_rate >= 0.8 else "warning",
             )
+
+            if prune.value and not result.dry_run and sync_type.value == "Playlist":
+                await _run_prune(s, t, result.playlist_name)
         except Exception as e:
             log_view.push(f"ERROR: {e}")
             ui.notify(str(e), type="negative")
         finally:
             start_btn.props(remove="loading")
+
+    async def _run_prune(src_adapter, tgt_adapter, playlist_name: str) -> None:  # type: ignore[no-untyped-def]
+        from playlist_sync.core.reconciler import Reconciler
+
+        prog_lbl.set_text("Computing prune plan…")
+        reconciler = Reconciler(src_adapter, tgt_adapter)
+        try:
+            plan = await reconciler.plan(playlist_name)
+        except Exception as e:
+            log_view.push(f"PRUNE ERROR: {e}")
+            ui.notify(f"Prune failed: {e}", type="negative")
+            return
+
+        if plan.is_empty:
+            log_view.push("  Prune: nothing to remove — playlist is clean.")
+            prog_lbl.set_text("Done")
+            return
+
+        confirmed = asyncio.Event()
+        answer = {"apply": False}
+        with ui.dialog().props("persistent") as prune_dlg, ui.card().style(
+            "background:#1a1a2e; border:1px solid #f59e0b; border-radius:16px; "
+            "padding:24px; min-width:520px; max-width:620px"
+        ):
+            ui.label(f"Prune {len(plan.removals)} stale tracks?").style(
+                "color:#f59e0b; font-weight:700; font-size:1rem; margin-bottom:4px"
+            )
+            ui.label("These target entries no longer belong (dropped from source, outdated "
+                     "versions, or duplicates). A snapshot is saved before removal.").style(
+                "color:#94a3b8; font-size:0.82rem; margin-bottom:10px"
+            )
+            with ui.column().classes("gap-1 w-full").style(
+                "max-height:280px; overflow-y:auto; background:#0f0f1a; "
+                "border-radius:8px; padding:10px"
+            ):
+                for track in plan.removals:
+                    ui.label(f"– {track.title} — {track.artist_str}").style(
+                        "color:#e2e8f0; font-size:0.8rem"
+                    )
+
+            def _decide(apply: bool) -> None:
+                answer["apply"] = apply
+                prune_dlg.close()
+                confirmed.set()
+
+            with ui.row().classes("gap-2 justify-end mt-3"):
+                ui.button("Keep everything", on_click=lambda: _decide(False)).props("flat color=grey")
+                ui.button(f"Remove {len(plan.removals)} tracks", color="orange",
+                          on_click=lambda: _decide(True))
+        prune_dlg.open()
+        await confirmed.wait()
+
+        if not answer["apply"]:
+            log_view.push("  Prune skipped.")
+            prog_lbl.set_text("Done")
+            return
+        prog_lbl.set_text("Pruning…")
+        removed = await reconciler.apply(plan)
+        log_view.push(f"  Pruned {removed} tracks (snapshot saved — see Snapshots page).")
+        prog_lbl.set_text("Done")
+        ui.notify(f"Pruned {removed} tracks", type="positive")
+
+
+# ── Review page (/review) ─────────────────────────────────────────────────────
+
+@ui.page("/review")
+async def review_page() -> None:
+    from playlist_sync.core.matcher import _track_score
+    from playlist_sync.core.models import Platform
+    from playlist_sync.core.review import (
+        load_low_confidence_mappings,
+        mapping_source_track,
+        update_mapping_target,
+    )
+    from playlist_sync.storage.database import create_db
+
+    ui.dark_mode().enable()
+    _nav("/review")
+
+    session_factory = create_db()
+    platform_map = {"Spotify": "spotify", "YouTube Music": "ytmusic"}
+    adapter_cache: dict = {}
+
+    with ui.column().classes("w-full p-8 gap-6"):
+        _heading("Review Matches")
+        ui.label("Low-confidence and AI-rescued matches — the ones most likely to be wrong "
+                 "versions. Corrections update the match cache; run a sync with Prune to "
+                 "apply them to the playlist.").style("color:#6b7280; max-width:640px")
+
+        with ui.row().classes("gap-4 items-end"):
+            src = ui.select(["Spotify", "YouTube Music"], label="From", value="Spotify")
+            tgt = ui.select(["Spotify", "YouTube Music"], label="To", value="YouTube Music")
+            threshold = ui.number(label="Below confidence", value=0.75, min=0.1, max=1.0,
+                                  step=0.05, format="%.2f")
+            load_btn = ui.button("Load", on_click=lambda: asyncio.ensure_future(_load()))
+
+        results_col = ui.column().classes("gap-3 w-full")
+
+    async def _target_adapter():  # type: ignore[no-untyped-def]
+        key = platform_map[tgt.value]
+        if key not in adapter_cache:
+            from playlist_sync.platforms.registry import get_platform_class
+            adapter = get_platform_class(Platform(key))()
+            await adapter.authenticate()
+            adapter_cache[key] = adapter
+        return adapter_cache[key]
+
+    async def _load() -> None:
+        results_col.clear()
+        load_btn.props("loading")
+        try:
+            mappings = load_low_confidence_mappings(
+                session_factory,
+                Platform(platform_map[src.value]),
+                Platform(platform_map[tgt.value]),
+                threshold=float(threshold.value or 0.75),
+                limit=50,
+            )
+            with results_col:
+                if not mappings:
+                    ui.label("Nothing to review at this threshold. 🎉").style("color:#4ade80")
+                for mapping in mappings:
+                    _mapping_card(mapping)
+        finally:
+            load_btn.props(remove="loading")
+
+    def _mapping_card(mapping) -> None:  # type: ignore[no-untyped-def]
+        src_platform = Platform(platform_map[src.value])
+        src_track = mapping_source_track(mapping, src_platform)
+        with _card().style("width:100%; max-width:680px; padding:16px"):
+            with ui.row().classes("items-center justify-between w-full"):
+                with ui.column().classes("gap-0"):
+                    ui.label(f"{src_track.title} — {src_track.artist_str}").style(
+                        "color:white; font-weight:600; font-size:0.92rem")
+                    ui.label(
+                        f"→ {mapping.target_title} — {mapping.target_artists.replace('||', ', ')}"
+                    ).style("color:#94a3b8; font-size:0.82rem")
+                with ui.row().classes("items-center gap-3"):
+                    color = "#f87171" if mapping.confidence < 0.6 else "#f59e0b"
+                    ui.badge(f"{mapping.confidence:.0%}").style(
+                        f"background:{color}; color:black; font-weight:700")
+                    ui.button("Fix", on_click=lambda m=mapping, s=src_track:
+                              asyncio.ensure_future(_open_fix(m, s))).props("outline color=purple")
+
+    async def _open_fix(mapping, src_track) -> None:  # type: ignore[no-untyped-def]
+        try:
+            adapter = await _target_adapter()
+            candidates = await adapter.search_track(src_track.search_query, limit=6)
+        except Exception as e:
+            ui.notify(f"Search failed: {e}", type="negative")
+            return
+
+        with ui.dialog() as dlg, ui.card().style(
+            "background:#1a1a2e; border:1px solid #7c3aed; border-radius:16px; "
+            "padding:24px; min-width:520px; max-width:620px"
+        ):
+            ui.label(f"Pick the correct match for: {src_track.title} — {src_track.artist_str}").style(
+                "color:#a78bfa; font-weight:700; margin-bottom:10px")
+
+            def _pick(track) -> None:  # type: ignore[no-untyped-def]
+                if update_mapping_target(session_factory, mapping.id, track):
+                    ui.notify("Mapping corrected — run a sync with Prune to apply it.",
+                              type="positive")
+                    dlg.close()
+                    asyncio.ensure_future(_load())
+                else:
+                    ui.notify("Could not update mapping", type="negative")
+
+            with ui.column().classes("gap-2 w-full"):
+                for cand in candidates:
+                    score = _track_score(src_track, cand)
+                    current = cand.platform_id == mapping.target_platform_id
+                    with ui.card().classes("w-full cursor-pointer").style(
+                        "background:#0f0f1a; border:1px solid "
+                        + ("#7c3aed" if current else "#2d2d4e")
+                        + "; border-radius:8px; padding:10px"
+                    ).on("click", lambda c=cand: _pick(c)):
+                        with ui.row().classes("justify-between items-center w-full"):
+                            with ui.column().classes("gap-0"):
+                                ui.label(cand.title + ("  (current)" if current else "")).style(
+                                    "color:white; font-size:0.88rem; font-weight:600")
+                                ui.label(cand.artist_str).style("color:#6b7280; font-size:0.78rem")
+                            ui.badge(f"{score:.0%}").style(
+                                "background:#2d2d4e; color:#e2e8f0; font-weight:600")
+            ui.button("Cancel", on_click=dlg.close).props("flat color=grey").classes("mt-2")
+        dlg.open()
+
+
+# ── Snapshots page (/snapshots) ───────────────────────────────────────────────
+
+@ui.page("/snapshots")
+async def snapshots_page() -> None:
+    from playlist_sync.core.models import Platform
+    from playlist_sync.platforms.registry import get_platform_class
+    from playlist_sync.storage.database import create_db
+    from playlist_sync.storage.snapshots import get_snapshot, list_snapshots, restore_snapshot
+
+    ui.dark_mode().enable()
+    _nav("/snapshots")
+
+    session_factory = create_db()
+
+    with ui.column().classes("w-full p-8 gap-6"):
+        _heading("Snapshots")
+        ui.label("Playlist states captured automatically before every sync, prune, and "
+                 "restore. Restoring brings the playlist back to that exact track list.").style(
+            "color:#6b7280; max-width:640px")
+        rows_col = ui.column().classes("gap-2 w-full")
+
+    def _render() -> None:
+        rows_col.clear()
+        snaps = list_snapshots(session_factory, limit=50)
+        with rows_col:
+            if not snaps:
+                ui.label("No snapshots yet — run a sync and one will appear here.").style(
+                    "color:#6b7280")
+            for snap in snaps:
+                with _card().style("width:100%; max-width:680px; padding:14px"):
+                    with ui.row().classes("items-center justify-between w-full"):
+                        with ui.column().classes("gap-0"):
+                            ui.label(f"#{snap.id}  {snap.playlist_name}").style(
+                                "color:white; font-weight:600; font-size:0.92rem")
+                            ui.label(
+                                f"{snap.platform} · {snap.track_count} tracks · "
+                                f"{snap.taken_at:%Y-%m-%d %H:%M} · {snap.reason}"
+                            ).style("color:#94a3b8; font-size:0.8rem")
+                        ui.button("Restore", on_click=lambda sid=snap.id:
+                                  asyncio.ensure_future(_confirm_restore(sid))).props(
+                            "outline color=orange")
+
+    async def _confirm_restore(snapshot_id: int) -> None:
+        snap = get_snapshot(session_factory, snapshot_id)
+        if snap is None:
+            ui.notify("Snapshot not found", type="negative")
+            return
+        with ui.dialog() as dlg, ui.card().style(
+            "background:#1a1a2e; border:1px solid #f59e0b; border-radius:16px; padding:24px"
+        ):
+            ui.label(f"Restore “{snap.playlist_name}” to snapshot #{snap.id}?").style(
+                "color:#f59e0b; font-weight:700; margin-bottom:6px")
+            ui.label(f"The playlist will be set back to exactly {snap.track_count} tracks "
+                     f"as of {snap.taken_at:%Y-%m-%d %H:%M}. The current state is snapshotted "
+                     "first, so this is reversible.").style("color:#94a3b8; font-size:0.84rem")
+
+            async def _do_restore() -> None:
+                dlg.close()
+                try:
+                    adapter = get_platform_class(Platform(snap.platform))()
+                    await adapter.authenticate()
+                    added, removed = await restore_snapshot(session_factory, adapter, snap)
+                    ui.notify(f"Restored — +{added} added, -{removed} removed", type="positive")
+                    _render()
+                except Exception as e:
+                    ui.notify(f"Restore failed: {e}", type="negative")
+
+            with ui.row().classes("gap-2 justify-end mt-3"):
+                ui.button("Cancel", on_click=dlg.close).props("flat color=grey")
+                ui.button("Restore", color="orange",
+                          on_click=lambda: asyncio.ensure_future(_do_restore()))
+        dlg.open()
+
+    _render()
 
 
 # ── History page (/history) ───────────────────────────────────────────────────

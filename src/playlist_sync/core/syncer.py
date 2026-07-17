@@ -9,7 +9,6 @@ from playlist_sync.core.models import (
     ConflictStrategy,
     MatchResult,
     MatchStatus,
-    Platform,
     Playlist,
     SyncResult,
     Track,
@@ -22,6 +21,7 @@ from playlist_sync.storage.database import (
     UnmatchedTrack,
     create_db,
 )
+from playlist_sync.storage.snapshots import save_snapshot
 
 # Callback types for progress reporting and interactive resolution
 ProgressCallback = Callable[[int, int, Track], None]
@@ -127,6 +127,10 @@ class Syncer:
             existing_target_pl = await self.target.get_playlist(target_pl.platform_id)
         else:
             existing_target_pl = Playlist(name=playlist_name, platform=self.target.platform)
+
+        # Safety net: capture the target's membership before this run writes to it.
+        if not dry_run and existing_target_pl.tracks:
+            save_snapshot(self._session_factory, existing_target_pl, reason="pre_sync")
         existing_keys = {
             (t.title.lower(), t.artist_str.lower()) for t in existing_target_pl.tracks
         }
@@ -451,6 +455,8 @@ class Syncer:
                     target_platform=self.target.platform.value,
                 )
                 session.add(row)
+            row.source_title = match.source_track.title
+            row.source_artists = match.source_track.artist_str
             row.target_platform_id = matched.platform_id
             row.target_title = matched.title
             row.target_artists = "||".join(matched.artists)
