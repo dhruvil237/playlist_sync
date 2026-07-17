@@ -287,3 +287,50 @@ async def test_matched_track_already_on_target_by_id_is_skipped(tmp_path) -> Non
     assert len(result.skipped) == 1
     assert result.matched == []
     assert target.added_track_ids == []
+
+
+async def test_match_cache_reused_across_runs_and_playlists(tmp_path) -> None:
+    source_tracks = [
+        Track(title="Song One", artists=["Artist"], platform=Platform.SPOTIFY, platform_id="src-1"),
+        Track(title="Song Two", artists=["Artist"], platform=Platform.SPOTIFY, platform_id="src-2"),
+    ]
+    matched_tracks = {
+        "src-1": Track(title="Song One", artists=["Artist"], platform=Platform.YTMUSIC, platform_id="yt-1"),
+        "src-2": Track(title="Song Two", artists=["Artist"], platform=Platform.YTMUSIC, platform_id="yt-2"),
+    }
+    db_factory = create_db(tmp_path / "history.db")
+
+    first_source = FakePlatform(Platform.SPOTIFY, [Playlist(
+        name="Road Trip", tracks=source_tracks, platform=Platform.SPOTIFY, platform_id="src-playlist")])
+    first_target = FakePlatform(Platform.YTMUSIC, [Playlist(
+        name="Road Trip", tracks=[], platform=Platform.YTMUSIC, platform_id="target-playlist")])
+    first_syncer = Syncer(first_source, first_target)
+    first_syncer._session_factory = db_factory
+    first_syncer.matcher = MappingMatcher(matched_tracks)
+    await first_syncer.sync_playlist("Road Trip")
+    assert first_syncer.matcher.calls == 2
+
+    # A DIFFERENT playlist containing the same tracks: matches come from the
+    # global cache, so the matcher must never be called.
+    second_source = FakePlatform(Platform.SPOTIFY, [Playlist(
+        name="Gym Mix", tracks=source_tracks, platform=Platform.SPOTIFY, platform_id="src-playlist-2")])
+    second_target = FakePlatform(Platform.YTMUSIC, [Playlist(
+        name="Gym Mix", tracks=[], platform=Platform.YTMUSIC, platform_id="target-playlist-2")])
+    second_syncer = Syncer(second_source, second_target)
+    second_syncer._session_factory = db_factory
+    second_syncer.matcher = MappingMatcher(matched_tracks, fail_if_called=True)
+
+    result = await second_syncer.sync_playlist("Gym Mix")
+
+    assert second_syncer.matcher.calls == 0
+    assert len(result.matched) == 2
+    assert second_target.added_track_ids == ["yt-1", "yt-2"]
+
+    # And with the cache disabled, the matcher is consulted again.
+    third_target = FakePlatform(Platform.YTMUSIC, [Playlist(
+        name="Gym Mix", tracks=[], platform=Platform.YTMUSIC, platform_id="target-playlist-3")])
+    third_syncer = Syncer(second_source, third_target, use_match_cache=False)
+    third_syncer._session_factory = db_factory
+    third_syncer.matcher = MappingMatcher(matched_tracks)
+    await third_syncer.sync_playlist("Gym Mix")
+    assert third_syncer.matcher.calls == 2

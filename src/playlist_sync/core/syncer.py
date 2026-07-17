@@ -15,7 +15,13 @@ from playlist_sync.core.models import (
     Track,
 )
 from playlist_sync.platforms.base import BasePlatform
-from playlist_sync.storage.database import SyncRun, SyncTrackState, UnmatchedTrack, create_db
+from playlist_sync.storage.database import (
+    SyncRun,
+    SyncTrackState,
+    TrackMapping,
+    UnmatchedTrack,
+    create_db,
+)
 
 # Callback types for progress reporting and interactive resolution
 ProgressCallback = Callable[[int, int, Track], None]
@@ -50,6 +56,8 @@ class Syncer:
         ai_base_url: Optional[str] = None,
         ai_api_key: Optional[str] = None,
         workers: int = 1,
+        use_match_cache: bool = True,
+        use_musicbrainz: bool = True,
     ) -> None:
         self.source = source
         self.target = target
@@ -59,9 +67,11 @@ class Syncer:
             ai_model=ai_model,
             ai_base_url=ai_base_url,
             ai_api_key=ai_api_key,
+            use_musicbrainz=use_musicbrainz,
         )
         self.confidence_threshold = confidence_threshold
         self.workers = max(1, workers)
+        self.use_match_cache = use_match_cache
         self._session_factory = create_db()
 
     async def sync_playlist(
@@ -174,17 +184,35 @@ class Syncer:
 
             pending_tracks.append((i, track, track_key))
 
+        cached_mappings = self._load_track_mappings([key for _, _, key in pending_tracks])
+
         match_batch_size = max(self.ADD_BATCH_SIZE, self.workers * self.MATCH_BATCH_MULTIPLIER)
         for batch_start in range(0, len(pending_tracks), match_batch_size):
             batch = pending_tracks[batch_start:batch_start + match_batch_size]
-            batch_tracks = [track for _, track, _ in batch]
-            if self.workers > 1:
-                batch_matches = await self.matcher.match_many(batch_tracks, self.target, workers=self.workers)
+            # Cached mappings skip search + AI entirely; only misses hit the matcher.
+            tracks_to_search = [track for _, track, key in batch if key not in cached_mappings]
+            if self.workers > 1 and tracks_to_search:
+                searched = await self.matcher.match_many(tracks_to_search, self.target, workers=self.workers)
             else:
-                batch_matches = [await self.matcher.match(track, self.target) for track in batch_tracks]
+                searched = [await self.matcher.match(track, self.target) for track in tracks_to_search]
+            searched_iter = iter(searched)
+            batch_matches: list[MatchResult] = []
+            for _, track, key in batch:
+                if key in cached_mappings:
+                    cached_track, cached_confidence = cached_mappings[key]
+                    batch_matches.append(MatchResult(
+                        source_track=track,
+                        matched_track=cached_track,
+                        status=MatchStatus.MATCHED,
+                        confidence=cached_confidence,
+                    ))
+                else:
+                    batch_matches.append(next(searched_iter))
 
             for (i, track, track_key), match in zip(batch, batch_matches):
                 if match.status == MatchStatus.MATCHED:
+                    if track_key not in cached_mappings:
+                        self._store_track_mapping(track_key, match)
                     matched_id = match.matched_track.platform_id if match.matched_track else None
                     if matched_id and matched_id in existing_target_ids:
                         # The matched video is already on the target (under different
@@ -206,11 +234,13 @@ class Syncer:
                         if chosen and chosen.platform_id and chosen.platform_id in existing_target_ids:
                             match.matched_track = chosen
                             match.status = MatchStatus.SKIPPED
+                            self._store_track_mapping(track_key, match)
                             result.skipped.append(match)
                             self._persist_track_state(run_id, i, match, applied=True)
                         elif chosen and chosen.platform_id:
                             match.matched_track = chosen
                             match.status = MatchStatus.MANUAL_OVERRIDE
+                            self._store_track_mapping(track_key, match)
                             result.matched.append(match)
                             existing_target_ids.add(chosen.platform_id)
                             tracks_to_add.append(chosen.platform_id)
@@ -273,14 +303,28 @@ class Syncer:
 
         liked = await self.source.get_liked_songs()
         tracks_to_like: list[str] = []
+        cached_mappings = self._load_track_mappings([self._source_track_key(t) for t in liked])
 
         for i, track in enumerate(liked):
             if on_progress:
                 on_progress(i + 1, len(liked), track)
 
-            match = await self.matcher.match(track, self.target)
+            track_key = self._source_track_key(track)
+            cached = cached_mappings.get(track_key)
+            if cached is not None:
+                cached_track, cached_confidence = cached
+                match = MatchResult(
+                    source_track=track,
+                    matched_track=cached_track,
+                    status=MatchStatus.MATCHED,
+                    confidence=cached_confidence,
+                )
+            else:
+                match = await self.matcher.match(track, self.target)
 
             if match.status == MatchStatus.MATCHED:
+                if cached is None:
+                    self._store_track_mapping(track_key, match)
                 result.matched.append(match)
                 if match.matched_track and match.matched_track.platform_id:
                     tracks_to_like.append(match.matched_track.platform_id)
@@ -289,6 +333,7 @@ class Syncer:
                 if chosen and chosen.platform_id:
                     match.matched_track = chosen
                     match.status = MatchStatus.MANUAL_OVERRIDE
+                    self._store_track_mapping(track_key, match)
                     result.matched.append(match)
                     tracks_to_like.append(chosen.platform_id)
                 else:
@@ -351,6 +396,68 @@ class Syncer:
 
     def _source_track_key(self, track: Track) -> str:
         return track.platform_id or f"{track.title.lower()}::{track.artist_str.lower()}"
+
+    def _load_track_mappings(self, keys: list[str]) -> dict[str, tuple[Track, float]]:
+        """Load cached source→target track mappings for the given source keys."""
+        if not self.use_match_cache or not keys:
+            return {}
+        session_ctx = self._session_factory()
+        if session_ctx is None:
+            return {}
+
+        with session_ctx as session:
+            rows = (
+                session.query(TrackMapping)
+                .filter(TrackMapping.source_platform == self.source.platform.value)
+                .filter(TrackMapping.target_platform == self.target.platform.value)
+                .filter(TrackMapping.source_track_key.in_(keys))
+                .all()
+            )
+            return {
+                row.source_track_key: (
+                    Track(
+                        title=row.target_title,
+                        artists=[a for a in row.target_artists.split("||") if a],
+                        album=row.target_album,
+                        platform_id=row.target_platform_id,
+                        platform=self.target.platform,
+                    ),
+                    row.confidence,
+                )
+                for row in rows
+            }
+
+    def _store_track_mapping(self, source_key: str, match: MatchResult) -> None:
+        """Persist a successful match so later runs (and other playlists) reuse it."""
+        matched = match.matched_track
+        if not self.use_match_cache or matched is None or not matched.platform_id:
+            return
+        session_ctx = self._session_factory()
+        if session_ctx is None:
+            return
+
+        with session_ctx as session:
+            row = (
+                session.query(TrackMapping)
+                .filter(TrackMapping.source_platform == self.source.platform.value)
+                .filter(TrackMapping.source_track_key == source_key)
+                .filter(TrackMapping.target_platform == self.target.platform.value)
+                .first()
+            )
+            if row is None:
+                row = TrackMapping(
+                    source_platform=self.source.platform.value,
+                    source_track_key=source_key,
+                    target_platform=self.target.platform.value,
+                )
+                session.add(row)
+            row.target_platform_id = matched.platform_id
+            row.target_title = matched.title
+            row.target_artists = "||".join(matched.artists)
+            row.target_album = matched.album
+            row.confidence = match.confidence
+            row.updated_at = datetime.utcnow()
+            session.commit()
 
     def _load_or_create_run(self, result: SyncResult, total_tracks: int) -> tuple[Optional[int], dict[str, SyncTrackState]]:
         session_ctx = self._session_factory()

@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, create_engine
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 DEFAULT_DB_PATH = Path.home() / ".config" / "playlist-sync" / "history.db"
@@ -52,6 +52,32 @@ class SyncTrackState(Base):
     matched_track_artists: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     matched_track_album: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     applied: Mapped[bool] = mapped_column(default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TrackMapping(Base):
+    """Global cross-run cache: a source track resolved to a target-platform track.
+
+    Once a track has been matched (fuzzy, AI, or manually), later syncs reuse the
+    mapping instead of searching and re-scoring — across runs and across playlists.
+    """
+
+    __tablename__ = "track_mappings"
+    __table_args__ = (
+        UniqueConstraint("source_platform", "source_track_key", "target_platform",
+                         name="uq_track_mapping"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_platform: Mapped[str] = mapped_column(String(50))
+    source_track_key: Mapped[str] = mapped_column(String(500), index=True)
+    target_platform: Mapped[str] = mapped_column(String(50))
+    target_platform_id: Mapped[str] = mapped_column(String(200))
+    target_title: Mapped[str] = mapped_column(String(500))
+    target_artists: Mapped[str] = mapped_column(String(1000))  # "||"-joined
+    target_album: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
